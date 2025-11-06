@@ -1,0 +1,303 @@
+{
+  "name": "RAG PDF Indexing - Free Version",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "index-pdfs",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "145c1228-04d0-4d23-b362-7466aa19df41",
+      "name": "Webhook Start",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        -832,
+        512
+      ],
+      "webhookId": "f3fdc318-a872-4acc-a054-fe3ed4e153c0"
+    },
+    {
+      "parameters": {
+        "command": "find /documenti -name '*.pdf' -type f"
+      },
+      "id": "fc413503-5a91-4846-ac7b-bfb8affae14b",
+      "name": "Find PDFs",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -608,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const files = $input.first().json.stdout.split('\\n').filter(f => f.trim());\n\nreturn files.map(filePath => ({\n  json: {\n    filePath: filePath,\n    fileName: filePath.split('/').pop()\n  }\n}));"
+      },
+      "id": "3276095d-b414-4637-8270-a911af571754",
+      "name": "Parse File List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -384,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "filePath": "={{ $json.filePath }}"
+      },
+      "id": "bf7fea08-131f-405f-9dc4-ca64aba4a98b",
+      "name": "Read PDF",
+      "type": "n8n-nodes-base.readBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        -160,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.UNSTRUCTURED_BASE_URL }}/general/v0/general",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "files"
+            },
+            {
+              "name": "strategy",
+              "value": "hi_res"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "fb030b0c-b532-4177-bdbd-d3bbe3ebb21c",
+      "name": "Extract Text",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        64,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = [];\nconst elements = $input.first().json;\nconst fileName = $('Parse File List').item.json.fileName;\n\nlet fullText = '';\nif (Array.isArray(elements)) {\n  fullText = elements\n    .map(el => el.text || '')\n    .filter(text => text.trim().length > 20)\n    .join('\\n\\n');\n}\n\nif (fullText.length < 50) return items;\n\nconst chunkSize = 1000;\nconst overlap = 200;\n\nfor (let i = 0; i < fullText.length; i += (chunkSize - overlap)) {\n  const chunk = fullText.slice(i, i + chunkSize).trim();\n  if (chunk.length < 100) continue;\n  \n  items.push({\n    json: {\n      text: chunk,\n      source: fileName,\n      chunk_index: Math.floor(i / (chunkSize - overlap))\n    }\n  });\n}\n\nreturn items;"
+      },
+      "id": "72adee36-4570-4852-bdd1-f1f92e96b46d",
+      "name": "Chunk Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        288,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/embedding-001:embedContent?key={{ $env.GEMINI_API_KEY }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"models/embedding-001\",\n  \"content\": {\n    \"parts\": [\n      {\n        \"text\": \"{{ $json.text }}\"\n      }\n    ]\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "08aeb7d8-fe26-4ec1-8de7-9bfec6eaae25",
+      "name": "Gemini Embeddings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        496,
+        512
+      ],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "jsCode": "const batchSize = 100;\nconst allItems = $input.all();\nconst batches = [];\n\nfor (let i = 0; i < allItems.length; i += batchSize) {\n  const batch = allItems.slice(i, i + batchSize);\n  \n  const points = batch.map((item, idx) => {\n    const embedding = item.json.embedding.values;\n    const originalData = $('Chunk Text').item.json;\n    \n    return {\n      id: `${Date.now()}-${i + idx}`,\n      vector: embedding,\n      payload: {\n        text: originalData.text,\n        source: originalData.source,\n        chunk_index: originalData.chunk_index\n      }\n    };\n  });\n  \n  batches.push({ json: { points } });\n}\n\nreturn batches;"
+      },
+      "id": "1fa37fbe-de96-4a38-93ba-268f640008c1",
+      "name": "Prepare Qdrant Batch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $env.QDRANT_BASE_URL }}/collections/{{ $env.QDRANT_COLLECTION }}/points?wait=true",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "api-key",
+              "value": "={{ $env.QDRANT_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "4f88abf3-55bb-4065-b4a7-fe71b7a43435",
+      "name": "Qdrant Upsert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        944,
+        512
+      ],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = $input.all();\nconst totalPoints = results.reduce((sum, r) => \n  sum + (r.json.result?.status === 'acknowledged' ? \n    JSON.parse(r.json.request?.body || '{}').points?.length || 0 : 0\n  ), 0\n);\n\nreturn [{\n  json: {\n    success: true,\n    total_indexed: totalPoints,\n    batches: results.length,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "dcf43806-b33e-44d8-87e3-c8443e885d32",
+      "name": "Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        512
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook Start": {
+      "main": [
+        [
+          {
+            "node": "Find PDFs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find PDFs": {
+      "main": [
+        [
+          {
+            "node": "Parse File List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse File List": {
+      "main": [
+        [
+          {
+            "node": "Read PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read PDF": {
+      "main": [
+        [
+          {
+            "node": "Extract Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text": {
+      "main": [
+        [
+          {
+            "node": "Chunk Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk Text": {
+      "main": [
+        [
+          {
+            "node": "Gemini Embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Embeddings": {
+      "main": [
+        [
+          {
+            "node": "Prepare Qdrant Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Qdrant Batch": {
+      "main": [
+        [
+          {
+            "node": "Qdrant Upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qdrant Upsert": {
+      "main": [
+        [
+          {
+            "node": "Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5d27d33b-bf7a-4ef7-ab35-7c456edc9806",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "317ffae62ba1601ac6b1b6574a98e7f37b33d9d3cc5401ebe2bfa6f8c37223ff"
+  },
+  "id": "QBNHmuP5XqAmxXVD",
+  "tags": []
+}
